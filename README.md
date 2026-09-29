@@ -286,7 +286,16 @@ APP_PORT=9000 docker compose up -d --build
     批次无法装入此箱；单独装箱即无共享设定点的批次整批不予装载，
     并报告 **首个失败的锁温组及涉及段**；
 - 运输时长超过货物「最长运输时长」时，该批整批不予装载并给出原因；
-- 达到最大箱数或单件体积超过单箱容量时，剩余货物按冲突输出。
+- 达到最大箱数或单件体积超过单箱容量时，剩余货物按冲突输出；
+- **体积按输入十进制值精确计算，四位小数仅用于输出**：箱体容量、单件体积的
+  累计与比较都按请求中的十进制数值进行（内部以十进制精确值保存，不引入二进制
+  浮点误差、不逐件舍入），**箱内累计体积恰好等于容量时可装，超出（哪怕
+  0.00001）不可装**；FFD 的总体积降序排序、禁配模式精确搜索的回溯与状态判重
+  同样使用未舍入值。箱内明细体积、箱体占用（`used_volume`）、总货量
+  （`total_cargo_volume`）、已装体积（`loaded_volume`）与未装体积
+  （`unloaded_volume`）均从 **未舍入的「件数 × 单件体积」** 汇总后各自四舍五入
+  到四位小数展示，**不得用展示值互相相减**（例如总货量展示为 1.0000 时，
+  未装体积仍可能是 0.3333）。
 
 ### 禁配装箱模式（`forbidden_mode=true`）
 
@@ -932,6 +941,57 @@ curl -X POST http://localhost:8000/api/plan \
 # 200 -> summary.boxes_used=2,forbidden_pairs=[{a:1,b:2,...}],
 #        forbidden_box_sequence=[1,1,1,2,2,2,1,1,2](禁配双方永不同箱)
 # 400 -> {"detail":"禁配装箱模式无解:在最大箱数 N 内不存在满足全部约束的
+#         全员装载方案……不返回部分方案,请调整后重试"}
+```
+
+### 容量边界与体积累计精度（普通模式 / 禁配模式）
+
+容量与体积累计按输入十进制值精确比较：**恰等容量可装，超出 0.00001 也不可装**；
+四位小数只用于展示。下面两类输入可以直接调用，用于核对这一行为。
+
+**示例 1（普通 FFD 模式）：容量 1、3 件各 0.33334。**
+3 × 0.33334 = 1.00002 **超出** 容量 1，1 个箱只装 2 件，第 3 件进入 `unloaded`
+（保留部分装载结果，不是整单失败）：
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "box_capacity": 1,
+    "max_boxes": 1,
+    "zones": [{"name": "通用", "t_min": -30, "t_max": 30}],
+    "cargoes": [
+      {"name": "小样A", "units": 3, "unit_volume": 0.33334, "t_min": 0, "t_max": 8}
+    ]
+  }'
+# 200 -> summary.all_loaded=false,
+#        loaded_units=2, unloaded_units=1,
+#        total_cargo_volume=1.0, loaded_volume=0.6667, unloaded_volume=0.3333
+#        (三个体积各自从未舍入累计值舍入,未装体积不是 1.0-0.6667)
+#        boxes[0].used_volume=0.6667;unloaded[0].volume=0.3333
+```
+
+**示例 2（禁配装箱模式）：容量 1.00008、3 件各 0.33336。**
+3 × 0.33336 = 1.00008 **恰好等于** 容量，必须全员装入同一箱（利用率 1.0）；
+容量改为 1.00007（少 0.00001）时则无解，返回 400 且不返回部分方案：
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "box_capacity": 1.00008,
+    "max_boxes": 1,
+    "forbidden_mode": true,
+    "zones": [{"name": "通用", "t_min": -30, "t_max": 30}],
+    "cargoes": [
+      {"name": "小样B", "units": 3, "unit_volume": 0.33336, "t_min": 0, "t_max": 8}
+    ]
+  }'
+# 200 -> summary.boxes_used=1, all_loaded=true, forbidden_box_sequence=[1,1,1]
+#        boxes[0].used_volume=1.0001, capacity=1.0001, utilization=1.0
+#        summary.total_cargo_volume=1.0001, loaded_volume=1.0001, unloaded_volume=0.0
+# 若把 box_capacity 改成 1.00007:
+# 400 -> {"detail":"禁配装箱模式无解:在最大箱数 1 内不存在满足全部约束的
 #         全员装载方案……不返回部分方案,请调整输入后重试"}
 ```
 
@@ -1337,7 +1397,8 @@ curl -X POST http://localhost:8000/api/temperature-review \
 │   ├── test_delay.py     # 延误推演测试(python tests/test_delay.py)
 │   ├── test_delivery.py  # 送达站点排程测试(python tests/test_delivery.py)
 │   ├── test_freight.py   # 分运费分摊测试(python tests/test_freight.py)
-│   └── test_forbidden.py
+│   ├── test_forbidden.py
+│   └── test_volume_precision.py  # 容量/体积累计精度(恰等可装、超出拒装、展示值不相减)
 ├── Dockerfile
 ├── docker-compose.yml # 含 SQLite 初始化与 handover-data 持久化卷
 ├── .env.example

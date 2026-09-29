@@ -33,6 +33,7 @@ from .planner import (
     _Iv,
     _Segment,
     _Zone,
+    _dec,
     _lock_units,
     _r,
     _simulate_heat,
@@ -79,7 +80,8 @@ def _build_batch(no: int, c: dict[str, Any]) -> _Batch:
     mh = c.get("max_transport_hours")
     max_hours = None if mh in (None, "", 0, "0") else float(mh)
     units = int(c["units"])
-    unit_volume = float(c["unit_volume"])
+    # 体积为精确十进制值(与规划器内部口径一致,仅热暴露用)
+    unit_volume = _dec(c["unit_volume"])
     return _Batch(
         no=no,
         name=str(c.get("name") or f"批次 {no}"),
@@ -89,7 +91,7 @@ def _build_batch(no: int, c: dict[str, Any]) -> _Batch:
         max_hours=max_hours,
         pref=pref,
         budget=budget,
-        total_volume=_r(units * unit_volume),
+        total_volume=units * unit_volume,
     )
 
 
