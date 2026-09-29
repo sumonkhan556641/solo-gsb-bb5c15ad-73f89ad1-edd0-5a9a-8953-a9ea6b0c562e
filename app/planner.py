@@ -19,8 +19,12 @@
   累计热暴露,选取使整组结束时箱内最大预算使用率最低的点,平局取较低温度;
   交集为空(不存在共享设定点)时该装箱组合不可用,并报告首个失败组及涉及段。
 - 同一批货物可按"件"为最小单位拆分到多个箱子。
+- 体积一律按输入十进制值(Decimal)精确计算:容量判定、体积累计、FFD 体积
+  排序以及禁配搜索的回溯与状态判重均不做中间舍入,容量恰等可装、超出不可装;
+  四位小数(_r)仅用于输出,箱内明细、箱体占用、总货量、已装及未装体积都从
+  未舍入的"件数 × 单件体积"汇总后分别舍入,绝不使用展示值相减。
 - 采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)的批次优先,
-  同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
+  同温限按总体积(未舍入精确值)降序;依次塞入已有箱子,放不下再开新箱。
 - 禁配装箱模式(forbidden_mode=true):货物行可填不可同箱的其他批号(当前列表
   序号,逗号分隔),单向填写视为双方禁配;非法批号或自身引用拒绝。启用时
   总件数限 1~10,同批允许逐件拆箱,任何箱不得同时装入禁配双方,并须通过
@@ -35,6 +39,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
 
 EPS = 1e-9
@@ -48,8 +53,36 @@ def input_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
-def _r(v: float) -> float:
-    """规整浮点输出,消除 -0.0 之类误差。"""
+def _dec(v: Any) -> Decimal:
+    """把体积/容量输入转为精确十进制值(按输入十进制字面量计算)。
+
+    容量判定、体积累计、FFD 体积排序及禁配搜索的回溯与状态判重一律使用该
+    精确值:容量恰等可装,超出不可装。四位小数(_r)仅用于输出展示,绝不
+    参与中间运算。入参为 int/float/str/Decimal:float 先取最短十进制表示
+    (JSON 数字经 Pydantic 解析后仍可往返还原用户输入),避免二进制误差。
+    """
+    if isinstance(v, Decimal):
+        d = v
+    elif isinstance(v, bool):
+        raise ValueError(f"非法体积数值: {v!r}")
+    else:
+        try:
+            d = Decimal(str(v))
+        except Exception:
+            raise ValueError(f"非法体积数值: {v!r}") from None
+    if not d.is_finite() or d <= 0:
+        raise ValueError(f"体积/容量须为正的有限数值,实际为 {v!r}")
+    return d
+
+
+def _r(v: Any) -> float:
+    """输出层规整:四位小数(消除 -0.0 之类误差)。
+
+    仅用于响应展示;体积/容量入参为 Decimal 时同样只在此处舍入,中间累计
+    (箱内明细、箱体占用、总货量、已装/未装体积)始终使用未舍入的精确值。
+    """
+    if isinstance(v, Decimal):
+        v = float(v)
     v = round(float(v), 4)
     return 0.0 if abs(v) < 1e-9 else v
 
@@ -171,18 +204,18 @@ class _Loaded:
     batch_no: int
     name: str
     units: int
-    volume: float
+    volume: Decimal  # 未舍入:件数 × 单件体积(精确十进制)
 
 
 @dataclass
 class _Box:
     index: int
-    capacity: float
+    capacity: Decimal
     segments: list[_Segment]
     # 禁配装箱模式下的禁配邻接表:批号 -> 与之不可同箱的批号集合;空 dict 表示
     # 不启用该约束(原 FFD 规划路径)
     forbidden: dict[int, set[int]] = field(default_factory=dict)
-    used: float = 0.0
+    used: Decimal = Decimal(0)
     items: list[_Loaded] = field(default_factory=list)
     # 已装入货物允许温区的交集;首件货物装入时初始化
     feasible: _Iv | None = None
@@ -194,7 +227,8 @@ class _Box:
     def try_load(self, batch: "_Batch", iv: _Iv) -> bool:
         """尝试装入 1 件货物,成功则更新箱内温度交集与容量。"""
         self.last_fail = None
-        if self.used + batch.unit_volume > self.capacity + EPS:
+        # 容量按输入十进制值判定:恰等(Decimal 精确相等)可装,超出不可装
+        if self.used + batch.unit_volume > self.capacity:
             self.last_fail = "capacity"
             return False
         # 禁配装箱:箱内已有该批的任一禁配批次时不得装入
@@ -228,7 +262,8 @@ class _Box:
                 return False
         if self.items and self.items[-1].batch_no == batch.no:
             self.items[-1].units += 1
-            self.items[-1].volume = _r(self.items[-1].volume + batch.unit_volume)
+            # 未舍入累计:始终从件数 × 单件体积推进,四位小数仅用于输出
+            self.items[-1].volume += batch.unit_volume
         else:
             self.items.append(
                 _Loaded(
@@ -238,7 +273,7 @@ class _Box:
                     volume=batch.unit_volume,
                 )
             )
-        self.used = _r(self.used + batch.unit_volume)
+        self.used += batch.unit_volume
         self.feasible = new_feasible
         if not already_in:
             self.lots.append(batch)
@@ -261,7 +296,7 @@ class _Box:
             "used": self.used,
             "items": len(self.items),
             "last_units": self.items[-1].units if self.items else 0,
-            "last_volume": self.items[-1].volume if self.items else 0.0,
+            "last_volume": self.items[-1].volume if self.items else Decimal(0),
             "feasible": self.feasible,
             "lots": len(self.lots),
         }
@@ -283,12 +318,12 @@ class _Batch:
     no: int
     name: str
     units: int
-    unit_volume: float
+    unit_volume: Decimal
     iv: _Iv
     max_hours: float | None
     pref: _Iv | None
     budget: float | None
-    total_volume: float
+    total_volume: Decimal  # 未舍入:件数 × 单件体积(精确十进制)
     # 禁配装箱模式下该批填写的禁配批号原文(None/空串表示未填)
     forbidden_raw: Any = None
 
@@ -457,7 +492,7 @@ def _pairs_to_adj(pairs: list[tuple[int, int]]) -> dict[int, set[int]]:
 
 def _solo_infeasible_reason(
     batch: _Batch,
-    box_capacity: float,
+    box_capacity: Decimal,
     volume_unit: str,
     segments: list[_Segment],
     transport_hours: float,
@@ -472,7 +507,7 @@ def _solo_infeasible_reason(
             f"货物 {batch.name}(批号 {batch.no})的运输时长 {_r(transport_hours)}h "
             f"超过允许的 {_r(batch.max_hours)}h,即使独占一箱也无法保证全程温度"
         )
-    if batch.unit_volume > box_capacity + EPS:
+    if batch.unit_volume > box_capacity:
         return (
             f"货物 {batch.name}(批号 {batch.no})的单件体积 {_r(batch.unit_volume)} "
             f"{volume_unit} 超过单箱容量 {_r(box_capacity)} {volume_unit},任何箱子均无法装载"
@@ -519,7 +554,7 @@ def _solo_infeasible_reason(
 def _solve_forbidden(
     batches: list[_Batch],
     pairs: list[tuple[int, int]],
-    box_capacity: float,
+    box_capacity: Decimal,
     max_boxes: int,
     segments: list[_Segment],
 ) -> list[_Box] | None:
@@ -531,6 +566,7 @@ def _solve_forbidden(
     首个可行 K 即箱数最少者。同批连续两件对内容相同的箱子(同样的占用体积、
     可行交集、在箱批次集合)是等价的,跳过对称分支;并以
     (件下标, 各箱占用, 各箱可行区间, 各箱批次集合, 剩余空箱数)记忆失败状态。
+    容量与占用均按输入十进制精确值计算与判重,不做任何中间舍入。
     """
     adj = _pairs_to_adj(pairs)
     # 逐件展开的放置序列:批号升序、同批 units 件
@@ -557,11 +593,12 @@ def _solve_forbidden(
                 k - state["opened"],
             ]
             for box in boxes[: state["opened"]]:
-                parts.append(round(box.used, 9))
+                # 占用体积用未舍入精确值入键(恰等/超出容量按十进制精确区分)
+                parts.append(box.used)
                 parts.append(
                     None
                     if box.feasible is None
-                    else (round(box.feasible.lo, 9), round(box.feasible.hi, 9))
+                    else (box.feasible.lo, box.feasible.hi)
                 )
                 parts.append(tuple(sorted(lot.no for lot in box.lots)))
             return tuple(parts)
@@ -580,10 +617,10 @@ def _solve_forbidden(
                 # 当前件后失败"的分支去重;try_load 失败(装不下/禁配)的箱子不做
                 # 对称剪枝——失败只与当前件有关,同一签名的其他箱子可能本应先尝试
                 sig = (
-                    round(box.used, 9),
+                    box.used,
                     None
                     if box.feasible is None
-                    else (round(box.feasible.lo, 9), round(box.feasible.hi, 9)),
+                    else (box.feasible.lo, box.feasible.hi),
                     tuple(sorted(lot.no for lot in box.lots)),
                 )
                 if sig in seen_ok_sig:
@@ -621,7 +658,7 @@ def _solve_forbidden(
 def _minimum_boxes_needed(
     batches: list[_Batch],
     pairs: list[tuple[int, int]],
-    box_capacity: float,
+    box_capacity: Decimal,
     segments: list[_Segment],
 ) -> int:
     """忽略用户最大箱数上限,求禁配装箱实际所需最少箱数(仅用于无解提示)。"""
@@ -635,7 +672,7 @@ def _minimum_boxes_needed(
 def _ffd_pack(
     batches: list[_Batch],
     *,
-    box_capacity: float,
+    box_capacity: Decimal,
     max_boxes: int,
     volume_unit: str,
     segments: list[_Segment],
@@ -647,18 +684,20 @@ def _ffd_pack(
     unloaded: list[dict[str, Any]] = []
 
     def add_unloaded(batch: _Batch, units: int, reason: str, **extra: Any) -> None:
+        # 明细体积从 未舍入件数 × 单件体积 汇总后单独舍入,不用展示值推算
         unloaded.append(
             {
                 "batch_no": batch.no,
                 "name": batch.name,
                 "units": units,
                 "volume": _r(units * batch.unit_volume),
+                "_volume_raw": units * batch.unit_volume,
                 "reason": reason,
                 **extra,
             }
         )
 
-    # 温度下限越低越苛刻,优先装;同温限按总体积降序
+    # 温度下限越低越苛刻,优先装;同温限按总体积(未舍入精确值)降序
     for b in sorted(batches, key=lambda x: (x.iv.lo, -x.total_volume)):
         # 1) 运输时长预检
         if b.max_hours is not None and transport_hours > b.max_hours + EPS:
@@ -765,7 +804,7 @@ def _ffd_pack(
                     tried_boxes=len(boxes),
                 )
                 break
-            if b.unit_volume > box_capacity + EPS:
+            if b.unit_volume > box_capacity:
                 add_unloaded(
                     b,
                     remaining,
@@ -849,13 +888,14 @@ def _ffd_pack(
 
 def plan(payload: dict[str, Any]) -> dict[str, Any]:
     """根据请求 payload 生成分箱方案;输入不合法时抛 ValueError。"""
-    box_capacity = float(payload.get("box_capacity", 0))
+    try:
+        box_capacity = _dec(payload.get("box_capacity", 0))
+    except ValueError:
+        raise ValueError("箱体容量必须是大于 0 的有限数值") from None
     max_boxes = int(payload.get("max_boxes", 100))
     volume_unit = str(payload.get("volume_unit") or "体积单位").strip() or "体积单位"
     forbidden_mode = bool(payload.get("forbidden_mode"))
 
-    if box_capacity <= 0:
-        raise ValueError("箱体容量必须大于 0")
     if max_boxes <= 0:
         raise ValueError("最大箱数必须大于 0")
 
@@ -917,11 +957,12 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         if lo > hi + EPS:
             raise ValueError(f"货物 {name} 的允许温度下限高于上限")
         units = int(c["units"])
-        unit_volume = float(c["unit_volume"])
+        try:
+            unit_volume = _dec(c["unit_volume"])
+        except ValueError:
+            raise ValueError(f"货物 {name} 的单件体积必须是大于 0 的有限数值") from None
         if units <= 0:
             raise ValueError(f"货物 {name} 的件数必须大于 0")
-        if unit_volume <= 0:
-            raise ValueError(f"货物 {name} 的单件体积必须大于 0")
         mh = c.get("max_transport_hours")
         max_hours = None if mh in (None, "", 0, "0") else float(mh)
         if max_hours is not None and max_hours < 0:
@@ -956,7 +997,8 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 max_hours=max_hours,
                 pref=pref,
                 budget=budget,
-                total_volume=_r(units * unit_volume),
+                # 总货量按未舍入件数 × 单件体积累计,仅输出时四位小数
+                total_volume=units * unit_volume,
                 forbidden_raw=c.get("forbidden_with"),
             )
         )
@@ -1025,7 +1067,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
 
     out_boxes: list[dict[str, Any]] = []
     loaded_units = 0
-    loaded_volume = 0.0
+    loaded_volume = Decimal(0)
     for box in boxes:
         assert box.feasible is not None
         # 逐段设定点:箱内有预算批次时按"最大累计预算使用率最低"贪心选取,
@@ -1159,7 +1201,8 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "heat_exposure_ok": heat_sim["ok"],
                 "used_volume": _r(box.used),
                 "capacity": _r(box.capacity),
-                "utilization": _r(min(1.0, box.used / box.capacity)),
+                # 占用率也由未舍入精确值计算,仅输出时四位舍入
+                "utilization": _r(min(Decimal(1), box.used / box.capacity)),
                 "items": items_out,
             }
         )
@@ -1167,6 +1210,10 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
     total_units = sum(c.units for c in batches)
     total_volume = sum(c.total_volume for c in batches)
     unloaded_units = sum(u["units"] for u in unloaded)
+    # 未装体积同样从 未舍入件数 × 单件体积 独立汇总,不用展示值相减
+    unloaded_volume = sum(
+        (u.pop("_volume_raw") for u in unloaded), Decimal(0)
+    )
     all_transportable = unloaded_units == 0 and all(
         b["transportable"] for b in out_boxes
     )
@@ -1200,7 +1247,8 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             "unloaded_units": unloaded_units,
             "total_cargo_volume": _r(total_volume),
             "loaded_volume": _r(loaded_volume),
-            "unloaded_volume": _r(total_volume - loaded_volume),
+            # 三类体积各自从精确值汇总后单独舍入,不用展示值相减
+            "unloaded_volume": _r(unloaded_volume),
             "boxes_used": len(boxes),
             "max_boxes": max_boxes,
             "all_loaded": unloaded_units == 0,

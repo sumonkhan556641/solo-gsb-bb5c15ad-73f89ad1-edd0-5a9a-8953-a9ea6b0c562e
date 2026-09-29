@@ -259,8 +259,13 @@ APP_PORT=9000 docker compose up -d --build
 - 分段模式下总运输时长 = 各段时长之和；若同时显式填写运输时长且与段时长
   之和不一致，接口返回 400 提示；
 - 同一批货物允许以 **件** 为最小单位拆分到多个箱子；
+- **体积按输入十进制值精确计算**：容量判定、体积累计、FFD 体积排序及禁配
+  搜索的回溯与状态判重都使用请求中的十进制数值（服务端按十进制精确运算，
+  不做浮点容差），**容量恰等即可装，超出即不可装**；**四位小数仅用于输出
+  展示**——箱内明细体积、箱体占用体积、总货量、已装体积与未装体积均从
+  **未舍入的「件数 × 单件体积」** 汇总后分别四位舍入，互不使用展示值相减；
 - 装箱采用 First-Fit-Decreasing 启发式：温度下限越低（要求越苛刻）的批次优先，
-  同温限按总体积降序，依次尝试已有箱子，放不下再开新箱；
+  同温限按总体积（未舍入精确值）降序，依次尝试已有箱子，放不下再开新箱；
 - **累计热暴露（度时）预算**（可选，按批次填写）：
   - 每批货物可填写 **首选温度区间** 与 **最大度时预算**（℃·h）；
     允许温区仍是硬边界，首选区间只是"更希望待在"的温度带；
@@ -906,6 +911,56 @@ curl -X POST http://localhost:8000/api/plan \
                  "t_min": 2, "t_max": 6}]
   }'
 ```
+
+### 容量边界示例 1：合计超出容量（1 m³、3 件 ×0.33334）
+
+3 件体积合计 `0.33334 × 3 = 1.00002`，**超出**容量 1，不能装入同一箱。
+普通模式（FFD）保留部分装载结果：前 2 件入箱（占用 0.6667），第 3 件进入
+`unloaded`，`all_loaded=false`（体积均按未舍入值判定与汇总，展示才四位舍入）：
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "box_capacity": 1,
+    "max_boxes": 1,
+    "zones": [{"name": "通用", "t_min": -30, "t_max": 30}],
+    "cargoes": [{"name": "货品A", "units": 3, "unit_volume": 0.33334,
+                 "t_min": 0, "t_max": 8}]
+  }'
+# 200 -> summary.loaded_units=2, unloaded_units=1, all_loaded=false,
+#        total_cargo_volume=1.0, loaded_volume=0.6667, unloaded_volume=0.3333;
+#        boxes[0].used_volume=0.6667, items=[{units:2, volume:0.6667}]
+```
+
+把 `max_boxes` 放宽为 2 即全员装载（箱 1 装 2 件、箱 2 装 1 件）。
+若以禁配模式（`"forbidden_mode": true`）且 `max_boxes=1` 提交同一输入，则因
+不存在全员方案返回 **400** 且无任何部分方案；`max_boxes=2` 时返回 2 箱、
+`forbidden_box_sequence=[1,1,2]`。
+
+### 容量边界示例 2：合计恰等容量（1.00008 m³、3 件 ×0.33336）
+
+3 件体积合计 `0.33336 × 3 = 1.00008`，与容量 **恰等**，按输入十进制精确比较
+必须可装（不因逐件四位舍入虚增为 1.0001 而被误拒）。普通模式与禁配模式
+（`max_boxes=1`）都应全员装入同一箱：
+
+```bash
+curl -X POST http://localhost:8000/api/plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "box_capacity": 1.00008,
+    "max_boxes": 1,
+    "zones": [{"name": "通用", "t_min": -30, "t_max": 30}],
+    "cargoes": [{"name": "货品B", "units": 3, "unit_volume": 0.33336,
+                 "t_min": 0, "t_max": 8}]
+  }'
+# 200 -> summary.boxes_used=1, loaded_units=3, unloaded_units=0, all_loaded=true,
+#        total_cargo_volume=loaded_volume=1.0001, unloaded_volume=0.0;
+#        boxes[0].used_volume=1.0001, capacity=1.0001, utilization=1.0
+```
+
+> 以上两例的 1.0001 / 0.6667 / 0.3333 均为**输出层四位小数值**；容量是否可装
+> 始终按请求中的十进制原值与未舍入累计判定。
 
 ### 禁配装箱模式
 
